@@ -47,6 +47,24 @@ inputs:
     default: false
     required: false
 
+  # Prefer a GitHub fork release over the default Determinate Systems source
+  use-github-fork:
+    description: "If true, download the daemon from a GitHub repo's release assets instead of the default source"
+    required: false
+    default: true
+  github-fork-repo:
+    description: "owner/repo of the GitHub repository that publishes the magic-nix-cache binaries"
+    required: false
+    default: "Camsbury/magic-nix-cache"
+  github-fork-ref:
+    description: "Release tag to use (use 'latest' for the latest release)"
+    required: false
+    default: "latest"
+  github-fork-asset:
+    description: "Exact asset name to download from the release. If empty, the asset will be auto-detected for the current OS/arch."
+    required: false
+    default: ""
+
   source-binary:
     description: Run a version of the cache binary from somewhere already on disk. Conflicts with all other `source-*` options.
     required: false

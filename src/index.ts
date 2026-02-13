@@ -131,6 +131,105 @@ class MagicNixCacheAction extends DetSysAction {
     await this.notifyAutoCache();
   }
 
+  // Download the magic-nix-cache binary from a GitHub repo's release assets
+  private async downloadGithubForkBinary(
+    ownerRepo: string,
+    ref: string,
+    assetNameOverride: string,
+  ): Promise<string> {
+    const token = process.env["GITHUB_TOKEN"] ?? process.env["GH_TOKEN"];
+    const apiBase = "https://api.github.com";
+
+    const client = got.extend({
+      headers: {
+        "User-Agent": "magic-nix-cache-action",
+        ...(token ? { Authorization: `token ${token}` } : {}),
+        Accept: "application/vnd.github+json",
+      },
+      retry: { limit: 1 },
+    });
+
+    const endpoint =
+      ref === "latest"
+        ? `${apiBase}/repos/${ownerRepo}/releases/latest`
+        : `${apiBase}/repos/${ownerRepo}/releases/tags/${ref}`;
+
+    actionsCore.debug(`Fetching GitHub release metadata: ${endpoint}`);
+    type Release = { assets: Array<{ name: string; browser_download_url: string }> };
+    const release = (await client.get(endpoint).json()) as Release;
+
+    let chosen:
+      | { name: string; browser_download_url: string }
+      | undefined = undefined;
+
+    if (assetNameOverride && assetNameOverride !== "") {
+      chosen = release.assets.find((a) => a.name === assetNameOverride);
+      if (!chosen) {
+        throw new Error(
+          `Asset '${assetNameOverride}' not found in release for ${ownerRepo}`,
+        );
+      }
+    } else {
+      const runnerOs = (process.env["RUNNER_OS"] ?? "").toLowerCase();
+      const runnerArch = (process.env["RUNNER_ARCH"] ?? "").toLowerCase();
+
+      const osHints: Record<string, string[]> = {
+        linux: ["linux", "unknown-linux-gnu"],
+        macos: ["darwin", "macos", "apple-darwin"],
+        windows: ["windows", "win"],
+      };
+      const archHints: Record<string, string[]> = {
+        x64: ["x86_64", "amd64"],
+        arm64: ["aarch64", "arm64"],
+      };
+
+      const osList =
+        runnerOs.includes("linux")
+          ? osHints.linux
+          : runnerOs.includes("mac")
+            ? osHints.macos
+            : runnerOs.includes("win")
+              ? osHints.windows
+              : [];
+      const archList =
+        runnerArch.includes("arm")
+          ? archHints.arm64
+          : archHints.x64;
+
+      const isChecksum = (name: string) =>
+        [".sha256", ".sha", ".sig", ".asc", ".txt"].some((s) =>
+          name.toLowerCase().endsWith(s),
+        );
+
+      chosen = release.assets.find((a) =>
+        !isChecksum(a.name) &&
+        osList.some((o) => a.name.toLowerCase().includes(o)) &&
+        archList.some((h) => a.name.toLowerCase().includes(h)) &&
+        // prefer plain binary or common archive extensions
+        ["", ".gz", ".xz", ".bz2", ".zip", ".tar", ".tar.gz", ".tar.xz"].some(
+          (ext) => a.name.toLowerCase().includes(ext),
+        ),
+      );
+
+      if (!chosen && release.assets.length === 1 && !isChecksum(release.assets[0].name)) {
+        chosen = release.assets[0];
+      }
+
+      if (!chosen) {
+        const available = release.assets.map((a) => a.name).join(", ");
+        throw new Error(
+          `Could not auto-detect a suitable asset for ${runnerOs}/${runnerArch}. Available assets: ${available}`,
+        );
+      }
+    }
+
+    actionsCore.info(`Downloading magic-nix-cache binary asset: ${chosen.name}`);
+    const dest = this.getTemporaryName();
+    const buf = await client.get(chosen.browser_download_url).buffer();
+    await fs.writeFile(dest, buf, { mode: 0o755 });
+    return dest;
+  }
+
   async post(): Promise<void> {
     // If strict mode is off and there was an error in main, such as the daemon not starting,
     // then the post phase is skipped with a warning.
@@ -187,10 +286,45 @@ class MagicNixCacheAction extends DetSysAction {
       `GitHub Action Cache URL: ${process.env["ACTIONS_CACHE_URL"]}`,
     );
 
-    const daemonBin = await this.unpackClosure("magic-nix-cache");
+    // Choose daemon source: GitHub fork release or default closure
+    let daemonBin: string;
+    const useGithubFork = inputs.getBool("use-github-fork");
+    if (useGithubFork) {
+      const forkRepo = inputs.getString("github-fork-repo");
+      const forkRef = inputs.getString("github-fork-ref");
+      const forkAsset = inputs.getString("github-fork-asset");
+      daemonBin = await this.downloadGithubForkBinary(forkRepo, forkRef, forkAsset);
+    } else {
+      daemonBin = await this.unpackClosure("magic-nix-cache");
+    }
+
+    actionsCore.info(`Using magic-nix-cache binary at: ${daemonBin}`);
+    const stat = await fs.stat(daemonBin).catch(() => undefined);
+    if (!stat || stat.size === 0) {
+      throw new Error(
+        `Downloaded daemon is missing or empty at ${daemonBin}. Ensure your release asset is a plain executable (not an archive).`,
+      );
+    }
+    try {
+      await fs.access(daemonBin, fs.constants.X_OK);
+    } catch {
+      // Try to chmod +x and re-check
+      await fs.chmod(daemonBin, 0o755);
+      await fs.access(daemonBin, fs.constants.X_OK).catch(() => {
+        throw new Error(
+          `Downloaded daemon is not executable at ${daemonBin}. Ensure your release asset is a plain executable (not an archive) and has execute permissions.`,
+        );
+      });
+    }
+
+    // Provide a stable subset of the GitHub context to avoid per-run cache keys
+    const safeContext = {
+      // Single shared cache namespace per repository
+      repository: process.env["GITHUB_REPOSITORY"] ?? "",
+    };
 
     const extraEnv = {
-      GITHUB_CONTEXT: JSON.stringify(actionsGithub.context),
+      GITHUB_CONTEXT: JSON.stringify(safeContext),
     };
     let runEnv = {};
     if (actionsCore.isDebug()) {
